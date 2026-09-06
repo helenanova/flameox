@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import csv
-import errno
 import hashlib
 import json
 import os
@@ -16,6 +15,7 @@ import sys
 import tempfile
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,6 +27,7 @@ from packaging.version import InvalidVersion, Version
 from pydantic import TypeAdapter
 
 from flameox import __version__
+from flameox.adapters.json_preview import iter_json_rows
 from flameox.canonical import canonical_bytes
 from flameox.command_binding import ExecutableResolver
 from flameox.executable_models import ResolvedExecutable
@@ -70,10 +71,8 @@ from flameox.providers.structured_workers import StructuredWorkerProviders
 from flameox.providers.xctrace import XctraceProvider
 from flameox.repository import (
     EvidenceRepository,
-    NativeArtifact,
+    EvidenceSelection,
     RepositoryError,
-    artifact_selector,
-    sha256_file,
 )
 from flameox.runtime_contracts import (
     CAPABILITY_BY_ID,
@@ -99,6 +98,13 @@ from flameox.runtime_contracts import (
     compatible_capture_providers,
 )
 from flameox.runtime_errors import DomainError, ErrorCode
+from flameox.source_files import (
+    NativeSource,
+    copy_verified_file,
+    directory_files,
+    hash_path,
+    sha256_file,
+)
 from flameox.workers.harness import IsolatedWorkerHarness, WorkerRuntimeConfig
 
 MAX_SESSION_ANALYSES = 64
@@ -107,29 +113,9 @@ MAX_SESSION_SCRATCH_FILES = 8192
 
 
 @dataclass(slots=True)
-class ResolvedSource:
-    path: Path
-    sha256: str
-    size_bytes: int
-    format: str
-    producer: str | None
-    role: str
-
-    def public(self) -> dict[str, Any]:
-        return {
-            "path": str(self.path),
-            "sha256": self.sha256,
-            "size_bytes": self.size_bytes,
-            "format": self.format,
-            "producer": self.producer,
-            "role": self.role,
-        }
-
-
-@dataclass(slots=True)
 class CachedAnalysis:
     result: dict[str, Any]
-    sources: list[ResolvedSource]
+    sources: list[NativeSource]
     manifest_body: dict[str, Any]
     preserved: dict[str, Any] | None = None
 
@@ -156,7 +142,7 @@ class BoundCapture:
 
 
 class AnalysisRuntime:
-    """Own registry, broker, scratch, conversions, and the session analysis cache."""
+    """Own registry, broker, scratch artifacts, and the session analysis cache."""
 
     def __init__(
         self,
@@ -205,7 +191,9 @@ class AnalysisRuntime:
             else "platform_default"
         )
         self.analyses: OrderedDict[str, CachedAnalysis] = OrderedDict()
-        self.conversions: OrderedDict[tuple[str, str], Path] = OrderedDict()
+        self.scratch_artifacts: OrderedDict[tuple[str, str], Path] = OrderedDict()
+        self._protected_sources: set[Path] = set()
+        self._capture_reservations: dict[Path, tuple[int, int]] = {}
         self.dependencies = ProviderDependencies(self.broker, self.scratch)
 
     def close(self) -> None:
@@ -217,13 +205,16 @@ class AnalysisRuntime:
         while len(self.analyses) > MAX_SESSION_ANALYSES:
             self._evict_oldest_analysis()
 
-    def _evict_oldest_analysis(self, *, protected_root: Path | None = None) -> bool:
+    def _evict_oldest_analysis(self, *, protected_roots: Sequence[Path] = ()) -> bool:
         selected = next(
             (
                 analysis_id
                 for analysis_id, cached in self.analyses.items()
-                if protected_root is None
-                or not any(source.path.is_relative_to(protected_root) for source in cached.sources)
+                if not any(
+                    source.path.is_relative_to(root) or root.is_relative_to(source.path)
+                    for source in cached.sources
+                    for root in protected_roots
+                )
             ),
             None,
         )
@@ -242,31 +233,39 @@ class AnalysisRuntime:
                 continue
             if relative.parts and relative.parts[0].startswith("capture-"):
                 capture_roots.add(self.scratch / relative.parts[0])
+            elif len(relative.parts) >= 2 and relative.parts[0] == "evidence-sources":
+                capture_roots.add(self.scratch / relative.parts[0] / relative.parts[1])
         for root in capture_roots:
             retained = any(
-                source.path.is_relative_to(root)
+                source.path.is_relative_to(root) or root.is_relative_to(source.path)
                 for analysis in self.analyses.values()
                 if analysis is not cached
                 for source in analysis.sources
             )
-            if not retained:
+            if not retained and not any(
+                path.is_relative_to(root) or root.is_relative_to(path)
+                for path in self._protected_sources | self._capture_reservations.keys()
+            ):
                 shutil.rmtree(root, ignore_errors=True)
+                for key, path in list(self.scratch_artifacts.items()):
+                    if path.is_relative_to(root):
+                        del self.scratch_artifacts[key]
 
     @staticmethod
-    def _remove_conversion(path: Path) -> None:
+    def _remove_scratch_artifact(path: Path) -> None:
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
         else:
             path.unlink(missing_ok=True)
 
-    def _cache_conversion(self, key: tuple[str, str], path: Path) -> None:
-        self.conversions[key] = path
-        self.conversions.move_to_end(key)
+    def _cache_scratch_artifact(self, key: tuple[str, str], path: Path) -> None:
+        self.scratch_artifacts[key] = path
+        self.scratch_artifacts.move_to_end(key)
         try:
             self._prune_scratch(protected_root=path)
         except RuntimeFailure:
-            self.conversions.pop(key, None)
-            self._remove_conversion(path)
+            self.scratch_artifacts.pop(key, None)
+            self._remove_scratch_artifact(path)
             raise
 
     def _prune_scratch(
@@ -276,26 +275,33 @@ class AnalysisRuntime:
         reserved_bytes: int = 0,
         reserved_files: int = 0,
     ) -> None:
-        used_bytes, used_files = self._scratch_usage()
+        used_bytes, used_files = self._scratch_commitment()
+        protected = (
+            self._protected_sources
+            | self._capture_reservations.keys()
+            | ({protected_root} if protected_root is not None else set())
+        )
         while (
             used_bytes + reserved_bytes > MAX_SESSION_SCRATCH_BYTES
             or used_files + reserved_files > MAX_SESSION_SCRATCH_FILES
         ):
-            if self._evict_oldest_analysis(protected_root=protected_root):
-                used_bytes, used_files = self._scratch_usage()
+            if self._evict_oldest_analysis(protected_roots=tuple(protected)):
+                used_bytes, used_files = self._scratch_commitment()
                 continue
             removable = next(
                 (
                     key
-                    for key, path in self.conversions.items()
-                    if protected_root is None or not path.is_relative_to(protected_root)
+                    for key, path in self.scratch_artifacts.items()
+                    if not any(
+                        path.is_relative_to(root) or root.is_relative_to(path) for root in protected
+                    )
                 ),
                 None,
             )
             if removable is None:
                 break
-            self._remove_conversion(self.conversions.pop(removable))
-            used_bytes, used_files = self._scratch_usage()
+            self._remove_scratch_artifact(self.scratch_artifacts.pop(removable))
+            used_bytes, used_files = self._scratch_commitment()
         if (
             used_bytes + reserved_bytes > MAX_SESSION_SCRATCH_BYTES
             or used_files + reserved_files > MAX_SESSION_SCRATCH_FILES
@@ -303,6 +309,34 @@ class AnalysisRuntime:
             raise RuntimeFailure("LIMIT_EXCEEDED", "Request exceeded the session scratch ceiling")
 
     def analyze(
+        self,
+        capability_id: str,
+        sources: Sequence[Source],
+        arguments: Mapping[str, Any],
+        *,
+        limits: RequestLimits | None = None,
+        continuation: str | None = None,
+    ) -> dict[str, Any]:
+        protected = self._protected_sources.copy()
+        retained_artifacts = set(self.scratch_artifacts)
+        try:
+            return self._analyze(
+                capability_id, sources, arguments, limits=limits, continuation=continuation
+            )
+        except BaseException:
+            for key in self.scratch_artifacts.keys() - retained_artifacts:
+                path = self.scratch_artifacts[key]
+                if not any(
+                    source.path.is_relative_to(path)
+                    for cached in self.analyses.values()
+                    for source in cached.sources
+                ):
+                    self._remove_scratch_artifact(self.scratch_artifacts.pop(key))
+            raise
+        finally:
+            self._protected_sources = protected
+
+    def _analyze(
         self,
         capability_id: str,
         sources: Sequence[Source],
@@ -387,10 +421,8 @@ class AnalysisRuntime:
                 raise RuntimeFailure(
                     "DECODE_FAILURE", "Artifact preview could not decode the input."
                 ) from error
-            if continuation is not None and offset >= observed:
-                raise RuntimeFailure(
-                    "INVALID_INPUT", "Continuation offset is beyond the available evidence"
-                )
+            if (continuation is not None or offset > 0) and offset >= observed:
+                raise RuntimeFailure("INVALID_INPUT", "Offset is beyond the available evidence")
             continuation_available = not complete
             truncation_reason = "row_limit"
             blocks: list[dict[str, Any]] = [
@@ -423,7 +455,7 @@ class AnalysisRuntime:
             }
             limitations = provider_analysis.limitations
         for source in resolved:
-            current_digest, current_size, _ = self._hash_path(
+            current_digest, current_size, _ = hash_path(
                 source.path,
                 max_bytes=selected_limits.max_input_bytes,
                 max_files=selected_limits.max_input_files,
@@ -570,11 +602,10 @@ class AnalysisRuntime:
         sequence = self._capture_sequence(cases, blocks, experiment)
         total = len(sequence)
         cwd = self._resolve_capture_cwd(target.cwd)
-        request_scratch = self.scratch / f"capture-{secrets.token_hex(12)}"
-        pending_executions: list[dict[str, Any]] = []
-        bound_captures: list[BoundCapture] = []
-        probed_workloads: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
-        try:
+        with self._capture_scope() as request_scratch:
+            pending_executions: list[dict[str, Any]] = []
+            bound_captures: list[BoundCapture] = []
+            probed_workloads: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
             for sequence_number, block, case in sequence:
                 argv = case.argv or target.argv
                 environment = {**target.environment, **case.environment}
@@ -652,257 +683,251 @@ class AnalysisRuntime:
             )
             self._reserve_capture_capacity(
                 total,
+                request_scratch=request_scratch,
                 provider_id=target.provider_id,
                 has_oracle=experiment is not None and experiment.semantic_oracle is not None,
                 limits=selected_limits,
             )
-        except BaseException:
-            shutil.rmtree(request_scratch, ignore_errors=True)
-            raise
-        try:
             request_scratch.mkdir()
             for item in bound_captures:
                 item.directory.mkdir()
                 materialize_capture_support(target.provider_id, item.directory)
-        except BaseException:
-            shutil.rmtree(request_scratch, ignore_errors=True)
-            raise
-        captured: list[ResolvedSource] = []
-        analysis_sources: list[ResolvedSource] = []
-        executions: list[dict[str, Any]] = []
-        for item in bound_captures:
-            sequence_number, block, case = item.sequence_number, item.block, item.case
-            if progress:
-                await progress(sequence_number - 1, total, f"capture {case.name} block {block}")
-            argv, environment, directory = item.argv, item.environment, item.directory
-            invocation, binding = item.invocation, item.binding
-            request = ExecutionRequest(
-                argv=invocation.argv,
-                executable_binding=binding,
-                cwd=cwd,
-                environment_allowlist=("PATH",),
-                environment_overrides=invocation.environment,
-                allowed_working_roots=(cwd,),
-                timeout_seconds=selected_limits.timeout_seconds,
-                max_output_bytes=selected_limits.max_output_bytes,
-                resource_policy=self._resource_policy(selected_limits, writable_root=directory),
-            )
-            failure_code: str | None = None
-            try:
-                outcome = await self.broker.run(request)
-                stdout = outcome.stdout
-                stderr = outcome.stderr
-                process = outcome.process
-                containment = outcome.containment.value
-            except ProcessExecutionError as error:
-                stdout = error.stdout or b""
-                stderr = error.stderr or b""
-                process = error.process
-                containment = "broker"
-                failure_code = error.code.value
-            for role, content in (("stdout", stdout), ("stderr", stderr)):
-                path = directory / f"{role}.txt"
-                path.write_bytes(content)
-                digest, size = sha256_file(path)
-                resolved_output = ResolvedSource(
-                    path,
-                    digest,
-                    size,
-                    "text",
-                    target.provider_id,
-                    f"capture-{sequence_number:04d}/{role}",
-                )
-                captured.append(resolved_output)
-                if target.provider_id == "direct":
-                    analysis_sources.append(resolved_output)
-            missing_artifact_roles: list[str] = []
-            for path, format_name, role in invocation.artifacts:
-                native = self._resolve_capture_artifact(
-                    path,
-                    format_name=format_name,
-                    role=role,
-                    provider_id=target.provider_id,
-                    limits=selected_limits,
-                )
-                if native is None:
-                    missing_artifact_roles.append(role)
-                    continue
-                captured_native = ResolvedSource(
-                    native.path,
-                    native.sha256,
-                    native.size_bytes,
-                    native.format,
-                    native.producer,
-                    f"capture-{sequence_number:04d}/{native.role}",
-                )
-                captured.append(captured_native)
-                analysis_sources.append(captured_native)
-            termination = process.termination
-            exit_code = getattr(termination, "exit_code", None)
-            status = "succeeded" if exit_code == 0 else "failed"
-            if status == "succeeded" and missing_artifact_roles:
-                status = "failed"
-                failure_code = "CAPTURE_ARTIFACT_MISSING"
-            oracle: dict[str, Any] | None = None
-            if (
-                status == "succeeded"
-                and experiment is not None
-                and experiment.semantic_oracle is not None
-            ):
-                oracle_argv = experiment.semantic_oracle
-                oracle_environment = {
-                    **environment,
-                    SEMANTIC_ORACLE_STDOUT_ENV: str(directory / "stdout.txt"),
-                    SEMANTIC_ORACLE_STDERR_ENV: str(directory / "stderr.txt"),
-                }
-                oracle_binding = self._require_capture_tool(
-                    oracle_argv[0],
-                    cwd=cwd,
-                    environment={**os.environ, **oracle_environment},
-                    request_scratch=request_scratch,
-                )
-                oracle_request = ExecutionRequest(
-                    argv=tuple(oracle_argv),
-                    executable_binding=oracle_binding,
+            captured: list[NativeSource] = []
+            analysis_sources: list[NativeSource] = []
+            executions: list[dict[str, Any]] = []
+            for item in bound_captures:
+                sequence_number, block, case = item.sequence_number, item.block, item.case
+                if progress:
+                    await progress(sequence_number - 1, total, f"capture {case.name} block {block}")
+                argv, environment, directory = item.argv, item.environment, item.directory
+                invocation, binding = item.invocation, item.binding
+                request = ExecutionRequest(
+                    argv=invocation.argv,
+                    executable_binding=binding,
                     cwd=cwd,
                     environment_allowlist=("PATH",),
-                    environment_overrides=oracle_environment,
+                    environment_overrides=invocation.environment,
                     allowed_working_roots=(cwd,),
                     timeout_seconds=selected_limits.timeout_seconds,
                     max_output_bytes=selected_limits.max_output_bytes,
                     resource_policy=self._resource_policy(selected_limits, writable_root=directory),
                 )
+                failure_code: str | None = None
                 try:
-                    oracle_outcome = await self.broker.run(oracle_request)
-                    oracle_stdout = oracle_outcome.stdout
-                    oracle_stderr = oracle_outcome.stderr
-                    oracle_process = oracle_outcome.process
-                    oracle_failure_code: str | None = None
+                    outcome = await self.broker.run(request)
+                    stdout = outcome.stdout
+                    stderr = outcome.stderr
+                    process = outcome.process
+                    containment = outcome.containment.value
                 except ProcessExecutionError as error:
-                    oracle_stdout = error.stdout or b""
-                    oracle_stderr = error.stderr or b""
-                    oracle_process = error.process
-                    oracle_failure_code = error.code.value
-                oracle_exit_code = getattr(oracle_process.termination, "exit_code", None)
-                for role, content in (
-                    ("oracle_stdout", oracle_stdout),
-                    ("oracle_stderr", oracle_stderr),
-                ):
+                    stdout = error.stdout or b""
+                    stderr = error.stderr or b""
+                    process = error.process
+                    containment = "broker"
+                    failure_code = error.code.value
+                for role, content in (("stdout", stdout), ("stderr", stderr)):
                     path = directory / f"{role}.txt"
                     path.write_bytes(content)
                     digest, size = sha256_file(path)
-                    captured.append(
-                        ResolvedSource(
-                            path,
-                            digest,
-                            size,
-                            "text",
-                            target.provider_id,
-                            f"capture-{sequence_number:04d}/{role}",
-                        )
+                    resolved_output = NativeSource(
+                        path,
+                        digest,
+                        size,
+                        "text",
+                        target.provider_id,
+                        f"capture-{sequence_number:04d}/{role}",
                     )
-                oracle = {
-                    "argv": oracle_argv,
-                    "returncode": oracle_exit_code,
-                    "status": "passed" if oracle_exit_code == 0 else "failed",
-                    "failure_code": oracle_failure_code,
-                }
-            self._prune_scratch(protected_root=request_scratch)
-            if oracle is not None and oracle["status"] == "failed":
-                status = "failed"
-                failure_code = "SEMANTIC_ORACLE_FAILED"
-            executions.append(
-                {
-                    "case": case.name,
-                    "block": block,
-                    "argv": argv,
-                    "capture_argv": list(invocation.argv),
-                    "cwd": str(cwd),
-                    "returncode": exit_code,
-                    "executable_sha256": binding.identity.sha256.removeprefix("sha256:"),
-                    "returncode_scope": invocation.returncode_scope,
-                    "workload_returncode": exit_code
-                    if invocation.returncode_scope == "workload"
-                    else None,
-                    "status": status,
-                    "failure_code": failure_code,
-                    "missing_artifact_roles": missing_artifact_roles,
-                    "semantic_oracle": oracle,
-                    "wall_time_ns": process.wall_time_ns,
-                    "containment": containment,
-                    "limit": self._terminated_limit(process, selected_limits),
-                }
+                    captured.append(resolved_output)
+                    if target.provider_id == "direct":
+                        analysis_sources.append(resolved_output)
+                missing_artifact_roles: list[str] = []
+                for path, format_name, role in invocation.artifacts:
+                    native = self._resolve_capture_artifact(
+                        path,
+                        format_name=format_name,
+                        role=role,
+                        provider_id=target.provider_id,
+                        limits=selected_limits,
+                    )
+                    if native is None:
+                        missing_artifact_roles.append(role)
+                        continue
+                    captured_native = NativeSource(
+                        native.path,
+                        native.sha256,
+                        native.size_bytes,
+                        native.format,
+                        native.producer,
+                        f"capture-{sequence_number:04d}/{native.role}",
+                    )
+                    captured.append(captured_native)
+                    analysis_sources.append(captured_native)
+                termination = process.termination
+                exit_code = getattr(termination, "exit_code", None)
+                status = "succeeded" if exit_code == 0 else "failed"
+                if status == "succeeded" and missing_artifact_roles:
+                    status = "failed"
+                    failure_code = "CAPTURE_ARTIFACT_MISSING"
+                oracle: dict[str, Any] | None = None
+                if (
+                    status == "succeeded"
+                    and experiment is not None
+                    and experiment.semantic_oracle is not None
+                ):
+                    oracle_argv = experiment.semantic_oracle
+                    oracle_environment = {
+                        **environment,
+                        SEMANTIC_ORACLE_STDOUT_ENV: str(directory / "stdout.txt"),
+                        SEMANTIC_ORACLE_STDERR_ENV: str(directory / "stderr.txt"),
+                    }
+                    oracle_binding = self._require_host_tool(
+                        oracle_argv[0],
+                        cwd=cwd,
+                        environment={**os.environ, **oracle_environment},
+                    )
+                    oracle_request = ExecutionRequest(
+                        argv=tuple(oracle_argv),
+                        executable_binding=oracle_binding,
+                        cwd=cwd,
+                        environment_allowlist=("PATH",),
+                        environment_overrides=oracle_environment,
+                        allowed_working_roots=(cwd,),
+                        timeout_seconds=selected_limits.timeout_seconds,
+                        max_output_bytes=selected_limits.max_output_bytes,
+                        resource_policy=self._resource_policy(
+                            selected_limits, writable_root=directory
+                        ),
+                    )
+                    try:
+                        oracle_outcome = await self.broker.run(oracle_request)
+                        oracle_stdout = oracle_outcome.stdout
+                        oracle_stderr = oracle_outcome.stderr
+                        oracle_process = oracle_outcome.process
+                        oracle_failure_code: str | None = None
+                    except ProcessExecutionError as error:
+                        oracle_stdout = error.stdout or b""
+                        oracle_stderr = error.stderr or b""
+                        oracle_process = error.process
+                        oracle_failure_code = error.code.value
+                    oracle_exit_code = getattr(oracle_process.termination, "exit_code", None)
+                    for role, content in (
+                        ("oracle_stdout", oracle_stdout),
+                        ("oracle_stderr", oracle_stderr),
+                    ):
+                        path = directory / f"{role}.txt"
+                        path.write_bytes(content)
+                        digest, size = sha256_file(path)
+                        captured.append(
+                            NativeSource(
+                                path,
+                                digest,
+                                size,
+                                "text",
+                                target.provider_id,
+                                f"capture-{sequence_number:04d}/{role}",
+                            )
+                        )
+                    oracle = {
+                        "argv": oracle_argv,
+                        "returncode": oracle_exit_code,
+                        "status": "passed" if oracle_exit_code == 0 else "failed",
+                        "failure_code": oracle_failure_code,
+                    }
+                self._prune_scratch(protected_root=request_scratch)
+                if oracle is not None and oracle["status"] == "failed":
+                    status = "failed"
+                    failure_code = "SEMANTIC_ORACLE_FAILED"
+                executions.append(
+                    {
+                        "case": case.name,
+                        "block": block,
+                        "argv": argv,
+                        "capture_argv": list(invocation.argv),
+                        "cwd": str(cwd),
+                        "returncode": exit_code,
+                        "executable_sha256": binding.identity.sha256.removeprefix("sha256:"),
+                        "returncode_scope": invocation.returncode_scope,
+                        "workload_returncode": exit_code
+                        if invocation.returncode_scope == "workload"
+                        else None,
+                        "status": status,
+                        "failure_code": failure_code,
+                        "missing_artifact_roles": missing_artifact_roles,
+                        "semantic_oracle": oracle,
+                        "wall_time_ns": process.wall_time_ns,
+                        "containment": containment,
+                        "limit": self._terminated_limit(process, selected_limits),
+                    }
+                )
+                self._check_capture_provenance_capacity(
+                    target=target,
+                    mode=mode,
+                    experiment=experiment,
+                    executions=executions,
+                    limit=selected_limits.max_provenance_bytes,
+                )
+                if progress:
+                    await progress(sequence_number, total, f"captured {case.name} block {block}")
+            effective_capability_id, analysis_sources = self._capture_analysis_sources(
+                capability_id, analysis_sources, captured
             )
-            self._check_capture_provenance_capacity(
-                target=target,
-                mode=mode,
-                experiment=experiment,
-                executions=executions,
-                limit=selected_limits.max_provenance_bytes,
-            )
-            if progress:
-                await progress(sequence_number, total, f"captured {case.name} block {block}")
-        effective_capability_id, analysis_sources = self._capture_analysis_sources(
-            capability_id, analysis_sources, captured
-        )
-        try:
-            result = self.analyze(
-                effective_capability_id,
-                [
-                    PathSource(path=str(item.path), format=item.format, producer=item.producer)
-                    for item in analysis_sources
-                ],
-                target.analysis_arguments,
-                limits=selected_limits,
-            )
-        except RuntimeFailure as error:
-            if not preserve:
-                shutil.rmtree(request_scratch, ignore_errors=True)
-                raise
-            result = self._capture_failure_result(
-                target=target,
+            try:
+                result = self.analyze(
+                    effective_capability_id,
+                    [
+                        PathSource(path=str(item.path), format=item.format, producer=item.producer)
+                        for item in analysis_sources
+                    ],
+                    target.analysis_arguments,
+                    limits=selected_limits,
+                )
+            except RuntimeFailure as error:
+                if not preserve:
+                    raise
+                result = self._capture_failure_result(
+                    target=target,
+                    capability_id=capability_id,
+                    mode=mode,
+                    experiment=experiment,
+                    executions=executions,
+                    captured=captured,
+                    limits=selected_limits,
+                    failure=error,
+                )
+                result["preserved"] = self.preserve_evidence(str(result["analysis_id"]))
+                return result
+            cached = self.analyses[str(result["analysis_id"])]
+            if target.provider_id == "py-spy":
+                py_spy_arguments = cast(PySpyCaptureArguments, capture_arguments)
+                process_scope = (
+                    "the target and newly created Python subprocesses"
+                    if py_spy_arguments.subprocesses
+                    else "the target process only"
+                )
+                result["limitations"].append(
+                    f"py-spy sampled {process_scope}; sampled stacks are not complete process-tree "
+                    "execution evidence."
+                )
+            cached.sources = captured
+            cached.manifest_body["capture_request"] = {
+                "target": target.model_dump(mode="json"),
+                "mode": mode,
+                "experiment": experiment.model_dump(mode="json") if experiment else None,
+                "executions": executions,
+            }
+            result = self._finalize_capture_result(
+                result,
+                cached,
                 capability_id=capability_id,
                 mode=mode,
                 experiment=experiment,
                 executions=executions,
-                captured=captured,
-                limits=selected_limits,
-                failure=error,
+                max_result_bytes=selected_limits.max_result_bytes,
             )
-            result["preserved"] = self.preserve_evidence(str(result["analysis_id"]))
+            if preserve:
+                result["preserved"] = self.preserve_evidence(str(result["analysis_id"]))
+            self._prune_scratch(protected_root=request_scratch)
             return result
-        cached = self.analyses[str(result["analysis_id"])]
-        if target.provider_id == "py-spy":
-            py_spy_arguments = cast(PySpyCaptureArguments, capture_arguments)
-            process_scope = (
-                "the target and newly created Python subprocesses"
-                if py_spy_arguments.subprocesses
-                else "the target process only"
-            )
-            result["limitations"].append(
-                f"py-spy sampled {process_scope}; sampled stacks are not complete process-tree "
-                "execution evidence."
-            )
-        cached.sources = captured
-        cached.manifest_body["capture_request"] = {
-            "target": target.model_dump(mode="json"),
-            "mode": mode,
-            "experiment": experiment.model_dump(mode="json") if experiment else None,
-            "executions": executions,
-        }
-        result = self._finalize_capture_result(
-            result,
-            cached,
-            capability_id=capability_id,
-            mode=mode,
-            experiment=experiment,
-            executions=executions,
-            max_result_bytes=selected_limits.max_result_bytes,
-        )
-        if preserve:
-            result["preserved"] = self.preserve_evidence(str(result["analysis_id"]))
-        self._prune_scratch(protected_root=request_scratch)
-        return result
 
     def _capture_failure_result(
         self,
@@ -912,7 +937,7 @@ class AnalysisRuntime:
         mode: str,
         experiment: ExperimentDesign | None,
         executions: list[dict[str, Any]],
-        captured: list[ResolvedSource],
+        captured: list[NativeSource],
         limits: RequestLimits,
         failure: RuntimeFailure,
     ) -> dict[str, Any]:
@@ -986,7 +1011,7 @@ class AnalysisRuntime:
             "coverage": validated["coverage"],
             "limitations": validated["limitations"],
         }
-        self.analyses[analysis_id] = CachedAnalysis(validated, captured, manifest_body)
+        self._cache_analysis(analysis_id, CachedAnalysis(validated, captured, manifest_body))
         return self._copy_result(validated)
 
     def _finalize_capture_result(
@@ -1154,20 +1179,6 @@ class AnalysisRuntime:
             )
         return executable
 
-    def _require_capture_tool(
-        self,
-        executable: str,
-        *,
-        cwd: Path,
-        environment: Mapping[str, str],
-        request_scratch: Path,
-    ) -> ResolvedExecutable:
-        try:
-            return self._require_host_tool(executable, cwd=cwd, environment=environment)
-        except RuntimeFailure:
-            shutil.rmtree(request_scratch, ignore_errors=True)
-            raise
-
     def _require_workload_python_provider(
         self,
         provider_id: str,
@@ -1236,24 +1247,24 @@ class AnalysisRuntime:
         role: str,
         provider_id: str,
         limits: RequestLimits,
-    ) -> ResolvedSource | None:
+    ) -> NativeSource | None:
         if not path.exists() or (not path.is_file() and not path.is_dir()):
             return None
-        digest, size, file_count = self._hash_path(
+        digest, size, file_count = hash_path(
             path,
             max_bytes=limits.max_input_bytes,
             max_files=limits.max_input_files,
         )
         if file_count == 0:
             return None
-        return ResolvedSource(path, digest, size, format_name, provider_id, role)
+        return NativeSource(path, digest, size, format_name, provider_id, role)
 
     @staticmethod
     def _capture_analysis_sources(
         capability_id: str,
-        analysis_sources: list[ResolvedSource],
-        captured: list[ResolvedSource],
-    ) -> tuple[str, list[ResolvedSource]]:
+        analysis_sources: list[NativeSource],
+        captured: list[NativeSource],
+    ) -> tuple[str, list[NativeSource]]:
         if analysis_sources:
             return capability_id, analysis_sources
         return "artifact.preview", [
@@ -1271,6 +1282,7 @@ class AnalysisRuntime:
         self,
         total: int,
         *,
+        request_scratch: Path,
         provider_id: str,
         has_oracle: bool,
         limits: RequestLimits,
@@ -1278,10 +1290,10 @@ class AnalysisRuntime:
         provider_files = 2 if provider_id == "coverage" else int(provider_id != "direct")
         files_per_capture = 2 + provider_files + (2 if has_oracle else 0)
         bounded_outputs = 1 + int(provider_id != "direct") + int(has_oracle)
-        self._prune_scratch(
-            reserved_bytes=total * bounded_outputs * limits.max_output_bytes,
-            reserved_files=total * files_per_capture,
-        )
+        reserved_bytes = total * bounded_outputs * limits.max_output_bytes
+        reserved_files = total * files_per_capture
+        self._prune_scratch(reserved_bytes=reserved_bytes, reserved_files=reserved_files)
+        self._capture_reservations[request_scratch] = (reserved_bytes, reserved_files)
 
     def preserve_evidence(self, analysis_id: str) -> dict[str, Any]:
         cached = self.analyses.get(analysis_id)
@@ -1304,88 +1316,10 @@ class AnalysisRuntime:
                 self.analyses.move_to_end(analysis_id)
                 return dict(cached.preserved)
         if cached.preserved is None:
-            artifacts: list[NativeArtifact] = []
-            source_layout: list[dict[str, Any]] = []
-            role_counts: dict[str, int] = {}
-            for source in cached.sources:
-                role_counts[source.role] = role_counts.get(source.role, 0) + 1
-            for source_index, source in enumerate(cached.sources, start=1):
-                publication_role = (
-                    source.role
-                    if role_counts[source.role] == 1
-                    else f"source-{source_index:04d}/{source.role}"
-                )
-                layout = {
-                    "role": publication_role,
-                    "sha256": source.sha256,
-                    "size_bytes": source.size_bytes,
-                    "format": source.format,
-                    "producer": source.producer,
-                    "is_directory": source.path.is_dir(),
-                    "artifact_indices": [],
-                }
-                source_layout.append(layout)
-                if source.path.is_file():
-                    layout["artifact_indices"] = [len(artifacts)]
-                    artifacts.append(
-                        NativeArtifact(
-                            source.path,
-                            publication_role,
-                            source.sha256,
-                            source.size_bytes,
-                            source.format,
-                            source.producer,
-                        )
-                    )
-                    continue
-                current_digest, current_size, _ = self._hash_path(source.path)
-                if (current_digest, current_size) != (source.sha256, source.size_bytes):
-                    raise RuntimeFailure(
-                        "MISSING_OR_CHANGED_INPUT",
-                        f"Input changed before preservation: {source.path}",
-                    )
-                files = self._directory_files(source.path)
-                layout["artifact_indices"] = list(
-                    range(len(artifacts), len(artifacts) + len(files))
-                )
-                for path in files:
-                    digest, size = sha256_file(path)
-                    relative = path.relative_to(source.path).as_posix()
-                    artifacts.append(
-                        NativeArtifact(
-                            path,
-                            f"{publication_role}:{relative}",
-                            digest,
-                            size,
-                            source.format,
-                            source.producer,
-                        )
-                    )
-            analysis_source_indices: list[int] = []
-            for item in cached.manifest_body["analysis_request"].get("inputs", []):
-                index = next(
-                    (
-                        index
-                        for index, source in enumerate(cached.sources)
-                        if (str(source.path), source.sha256, source.format, source.producer)
-                        == (item["path"], item["sha256"], item["format"], item.get("producer"))
-                    ),
-                    None,
-                )
-                if index is None:
-                    analysis_source_indices = []
-                    break
-                analysis_source_indices.append(index)
             try:
                 cached.preserved = self.repository.preserve(
-                    manifest_body=cached.manifest_body
-                    | {
-                        "source_layout": {
-                            "sources": source_layout,
-                            "analysis_sources": analysis_source_indices,
-                        }
-                    },
-                    artifacts=artifacts,
+                    manifest_body=cached.manifest_body,
+                    sources=cached.sources,
                     analysis=self._durable_analysis(cached.result),
                 )
                 self._release_analysis_scratch(cached)
@@ -1518,8 +1452,13 @@ class AnalysisRuntime:
                 "configuration_variable": "FLAMEOX_DATA_DIR",
                 "store_identifier": hashlib.sha256(str(self.repository.root).encode()).hexdigest(),
                 "recovery": [
-                    "Restore the original repository from a known-good backup; do not delete "
-                    "existing data or synthesize repository.json.",
+                    (
+                        "Inspect or export this store with a Flameox release that supports its "
+                        "format. Do not edit version fields or rewrite existing evidence."
+                        if error.code == "UNSUPPORTED_REPOSITORY_FORMAT"
+                        else "Restore the original repository from a known-good backup; do not "
+                        "delete existing data or synthesize repository.json."
+                    ),
                     "Alternatively set FLAMEOX_DATA_DIR to a distinct empty directory and "
                     "restart or reconnect Flameox. Switching stores does not recover old evidence; "
                     "preserve any recoverable session evidence before ending the session.",
@@ -1530,57 +1469,92 @@ class AnalysisRuntime:
 
     def _resolve_sources(
         self, sources: Sequence[Source], limits: RequestLimits
-    ) -> list[ResolvedSource]:
+    ) -> list[NativeSource]:
         if not 1 <= len(sources) <= MAX_INPUTS:
             raise RuntimeFailure("INVALID_INPUT", "sources must contain 1 to 32 entries")
-        result: list[ResolvedSource] = []
-        total_size = 0
-        total_files = 0
+        admitted: list[NativeSource | EvidenceSelection] = []
+        total_size = total_files = 0
         for source_index, source in enumerate(sources):
             if isinstance(source, EvidenceSource):
-                resolved_evidence = self._resolve_evidence_source(source)
-                total_size += resolved_evidence.size_bytes
-                total_files += (
-                    1
-                    if resolved_evidence.path.is_file()
-                    else len(self._directory_files(resolved_evidence.path))
-                )
-                if total_size > limits.max_input_bytes:
-                    raise RuntimeFailure("LIMIT_EXCEEDED", "Evidence input exceeds max_input_bytes")
-                if total_files > limits.max_input_files:
-                    raise RuntimeFailure("LIMIT_EXCEEDED", "Input exceeds max_input_files")
-                result.append(resolved_evidence)
-                continue
-            path = Path(source.path)
-            if not path.is_absolute():
-                raise RuntimeFailure(
-                    "INVALID_INPUT", f"Source path must be absolute: {source.path}"
-                )
-            try:
-                path = path.resolve(strict=True)
-            except OSError as exc:
-                raise RuntimeFailure(
-                    "MISSING_OR_CHANGED_INPUT", f"Source is missing: {source.path}"
-                ) from exc
-            digest, size, file_count = self._hash_path(
-                path,
-                max_bytes=limits.max_input_bytes - total_size,
-                max_files=limits.max_input_files - total_files,
-            )
-            total_size += size
-            total_files += file_count
-            if source.expected_sha256 and digest != source.expected_sha256:
-                raise RuntimeFailure("MISSING_OR_CHANGED_INPUT", f"SHA-256 mismatch: {source.path}")
-            result.append(
-                ResolvedSource(
+                try:
+                    selection = self.repository.select_source(
+                        source.evidence_id,
+                        selector=source.artifact_selector,
+                        role=source.artifact_role,
+                    )
+                except RepositoryError as error:
+                    failure = self._repository_failure(error)
+                    failure.details["resource_uri"] = f"flameox://evidence/{source.evidence_id}"
+                    raise failure from error
+                total_size += selection.source.size_bytes
+                total_files += len(selection.members)
+                if total_size > limits.max_input_bytes or total_files > limits.max_input_files:
+                    raise RuntimeFailure(
+                        "LIMIT_EXCEEDED", "Evidence exceeds input byte or file limits"
+                    )
+                admitted.append(selection)
+            else:
+                path = Path(source.path)
+                if not path.is_absolute():
+                    raise RuntimeFailure(
+                        "INVALID_INPUT", f"Source path must be absolute: {source.path}"
+                    )
+                try:
+                    path = path.resolve(strict=True)
+                except OSError as exc:
+                    raise RuntimeFailure(
+                        "MISSING_OR_CHANGED_INPUT", f"Source is missing: {source.path}"
+                    ) from exc
+                digest, size, file_count = hash_path(
                     path,
-                    digest,
-                    size,
-                    source.format or self._sniff(path),
-                    source.producer,
-                    "input" if len(sources) == 1 else f"input-{source_index + 1:04d}",
+                    max_bytes=limits.max_input_bytes - total_size,
+                    max_files=limits.max_input_files - total_files,
                 )
-            )
+                total_size += size
+                total_files += file_count
+                if source.expected_sha256 and digest != source.expected_sha256:
+                    raise RuntimeFailure(
+                        "MISSING_OR_CHANGED_INPUT", f"SHA-256 mismatch: {source.path}"
+                    )
+                admitted.append(
+                    NativeSource(
+                        path,
+                        digest,
+                        size,
+                        source.format or self._sniff(path),
+                        source.producer,
+                        "input" if len(sources) == 1 else f"input-{source_index + 1:04d}",
+                    )
+                )
+        # Admit the entire request before allocating any bundle. Pin every source so
+        # acquiring a later input or conversion cannot evict an earlier input.
+        needed: dict[Path, EvidenceSelection] = {}
+        for item in admitted:
+            if isinstance(item, EvidenceSelection):
+                if item.source.is_directory:
+                    path = self._evidence_destination(item)
+                    self._protected_sources.add(path)
+                    if not path.exists():
+                        needed[path] = item
+            elif item.path.is_relative_to(self.scratch):
+                self._protected_sources.add(item.path)
+        self._prune_scratch(
+            reserved_bytes=sum(item.source.size_bytes for item in needed.values()),
+            reserved_files=sum(len(item.members) for item in needed.values()),
+        )
+        result = []
+        for item in admitted:
+            if isinstance(item, EvidenceSelection):
+                try:
+                    self.repository.verify_source(item)
+                except RepositoryError as error:
+                    raise self._repository_failure(error) from error
+                if item.source.is_directory:
+                    result.append(self._materialize_evidence_bundle(item))
+                else:
+                    result.append(item.members[0][1])
+            else:
+                result.append(item)
         return result
 
     @staticmethod
@@ -1619,158 +1593,59 @@ class AnalysisRuntime:
             return "json"
         return "text"
 
-    def _resolve_evidence_source(self, source: EvidenceSource) -> ResolvedSource:
-        manifest = self.read_evidence(source.evidence_id)
-        artifacts = manifest["body"].get("artifacts", [])
-        if not isinstance(artifacts, list):
-            raise RuntimeFailure("REPOSITORY_CORRUPTION", "Evidence artifacts are invalid")
-        role = source.artifact_role
-        logical = self.repository.logical_artifacts(manifest["body"])
-        selected_source: dict[str, Any] | None = None
-        if source.artifact_selector is not None:
-            selected_source = next(
-                (
-                    item
-                    | {"is_directory": collection == "logical" and item.get("is_directory", False)}
-                    for collection, items in (("artifact", artifacts), ("logical", logical))
-                    for index, item in enumerate(items)
-                    if artifact_selector(source.evidence_id, collection, index)
-                    == source.artifact_selector
-                ),
-                None,
-            )
-            if selected_source is None:
-                raise RuntimeFailure(
-                    "MISSING_EVIDENCE",
-                    "The requested evidence artifact selector is absent",
-                    details={"resource_uri": f"flameox://evidence/{source.evidence_id}"},
-                )
-            role = selected_source["role"]
-        if role is None:
-            try:
-                role = self._default_evidence_role(logical)
-            except RuntimeFailure as error:
-                raise RuntimeFailure(
-                    error.code,
-                    error.message,
-                    details={"resource_uri": f"flameox://evidence/{source.evidence_id}"},
-                ) from error
-        if selected_source is None:
-            # Legacy role selection also prefers an exact file over a bundle prefix.
-            selected_source = next(
-                (
-                    item
-                    for item in [
-                        *(artifact | {"is_directory": False} for artifact in artifacts),
-                        *logical,
-                    ]
-                    if item["role"] == role
-                ),
-                None,
-            )
-        if selected_source is None:
-            raise RuntimeFailure(
-                "MISSING_EVIDENCE", "The requested evidence artifact role is absent"
-            )
-        if selected_source.get("is_directory", False):
-            selected = [artifacts[index] for index in selected_source["artifact_indices"]]
-            return self._materialize_evidence_bundle(
-                source.evidence_id, role, selected, selected_source
-            )
-        artifact = selected_source
-        digest = str(artifact["sha256"])
-        path = self.repository.root / "artifacts" / "sha256" / digest[:2] / digest / "payload"
-        return ResolvedSource(
-            path,
-            digest,
-            int(artifact["size_bytes"]),
-            str(artifact["format"]),
-            str(artifact["producer"]) if artifact.get("producer") is not None else None,
-            str(artifact.get("role", "input")),
-        )
+    def _evidence_destination(self, selection: EvidenceSelection) -> Path:
+        key = hashlib.sha256(
+            f"{selection.evidence_id}:{selection.source.role}".encode()
+        ).hexdigest()
+        return self.scratch / "evidence-sources" / key
 
-    @staticmethod
-    def _default_evidence_role(artifacts: list[Any]) -> str:
-        roots = {
-            str(item["role"])
-            for item in artifacts
-            if isinstance(item, dict)
-            and isinstance(item.get("role"), str)
-            and not str(item["role"]).endswith(
-                ("/stdout", "/stderr", "/oracle_stdout", "/oracle_stderr")
-            )
-        }
-        if len(roots) != 1:
-            raise RuntimeFailure(
-                "INVALID_INPUT",
-                "artifact_role is required when evidence contains multiple logical sources",
-            )
-        return roots.pop()
-
-    def _materialize_evidence_bundle(
-        self,
-        evidence_id: str,
-        role: str,
-        artifacts: list[dict[str, Any]],
-        metadata: dict[str, Any],
-    ) -> ResolvedSource:
-        bundle_key = hashlib.sha256(f"{evidence_id}:{role}".encode()).hexdigest()
-        destination = self.scratch / "evidence-sources" / bundle_key
+    def _materialize_evidence_bundle(self, selection: EvidenceSelection) -> NativeSource:
+        destination = self._evidence_destination(selection)
+        key = (selection.evidence_id, f"evidence:{selection.source.role}")
         if not destination.exists():
             destination.parent.mkdir(parents=True, exist_ok=True)
             stage = Path(
                 tempfile.mkdtemp(prefix=f"{destination.name}.partial-", dir=destination.parent)
             )
             try:
-                for artifact in artifacts:
-                    artifact_role = str(artifact["role"])
-                    if not artifact_role.startswith(role + ":"):
-                        raise RuntimeFailure(
-                            "REPOSITORY_CORRUPTION", "Evidence bundle member role is invalid"
-                        )
-                    relative = Path(artifact_role[len(role) + 1 :])
-                    if relative.is_absolute() or ".." in relative.parts or not relative.parts:
-                        raise RuntimeFailure(
-                            "REPOSITORY_CORRUPTION", "Evidence bundle member path is invalid"
-                        )
-                    digest = str(artifact["sha256"])
-                    payload = (
-                        self.repository.root
-                        / "artifacts"
-                        / "sha256"
-                        / digest[:2]
-                        / digest
-                        / "payload"
-                    )
+                for relative, artifact in selection.members:
+                    assert relative is not None
                     target = stage / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(payload, target)
-                try:
-                    stage.rename(destination)
-                except OSError as error:
-                    if error.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                        raise
+                    try:
+                        copy_verified_file(artifact, target)
+                    except RuntimeFailure as error:
+                        raise self._repository_failure(
+                            RepositoryError("REPOSITORY_CORRUPTION", error.message)
+                        ) from error
+                stage.rename(destination)
             finally:
                 if stage.exists():
                     shutil.rmtree(stage)
-        digest, size, _file_count = self._hash_path(destination)
-        formats = {str(item["format"]) for item in [*artifacts, metadata]}
-        producers = {
-            str(item["producer"]) if item.get("producer") is not None else None
-            for item in [*artifacts, metadata]
-        }
-        if (
-            len(formats) != 1
-            or len(producers) != 1
-            or (digest, size) != (metadata["sha256"], metadata["size_bytes"])
-        ):
-            raise RuntimeFailure(
-                "REPOSITORY_CORRUPTION", "Evidence bundle metadata is inconsistent"
+        self.scratch_artifacts[key] = destination
+        self.scratch_artifacts.move_to_end(key)
+        source = selection.source
+        try:
+            digest, size, _ = hash_path(
+                destination, max_bytes=source.size_bytes, max_files=len(selection.members)
             )
-        return ResolvedSource(destination, digest, size, formats.pop(), producers.pop(), role)
+            if (digest, size) != (source.sha256, source.size_bytes):
+                raise RuntimeFailure("MISSING_OR_CHANGED_INPUT", "Evidence materialization changed")
+        except (OSError, RuntimeFailure) as error:
+            raise self._repository_failure(
+                RepositoryError("REPOSITORY_CORRUPTION", "Evidence materialization is invalid.")
+            ) from error
+        return NativeSource(
+            destination,
+            source.sha256,
+            source.size_bytes,
+            source.format,
+            source.producer,
+            source.role,
+        )
 
     def _read_rows(
-        self, sources: list[ResolvedSource], offset: int, limit: int
+        self, sources: list[NativeSource], offset: int, limit: int
     ) -> tuple[list[dict[str, Any]], int, bool]:
         rows: list[dict[str, Any]] = []
         observed = 0
@@ -1787,7 +1662,7 @@ class AnalysisRuntime:
     def _provider_analysis(
         self,
         capability_id: str,
-        sources: list[ResolvedSource],
+        sources: list[NativeSource],
         arguments: Mapping[str, Any],
         *,
         max_rows: int,
@@ -1991,7 +1866,7 @@ class AnalysisRuntime:
     def _platform_trace_analysis(
         self,
         capability_id: str,
-        sources: list[ResolvedSource],
+        sources: list[NativeSource],
         *,
         max_rows: int,
         limits: RequestLimits,
@@ -2020,15 +1895,15 @@ class AnalysisRuntime:
             return self.xctrace.analyze(path, max_rows=max_rows, provider_version=provider_version)
         return None
 
-    def _perf_collapsed(self, source: ResolvedSource, limits: RequestLimits) -> tuple[Path, str]:
+    def _perf_collapsed(self, source: NativeSource, limits: RequestLimits) -> tuple[Path, str]:
         binding = ExecutableResolver().require_host_tool(
             "perf", cwd=source.path.parent, environment=dict(os.environ)
         )
         provider_version = binding.identity.sha256
         key = (source.sha256, f"perf-script:{provider_version}")
-        cached = self.conversions.get(key)
+        cached = self.scratch_artifacts.get(key)
         if cached is not None and cached.is_file():
-            self.conversions.move_to_end(key)
+            self.scratch_artifacts.move_to_end(key)
             return cached, "perf"
         conversion_root = self.scratch / "conversions"
         conversion_root.mkdir(exist_ok=True)
@@ -2052,7 +1927,7 @@ class AnalysisRuntime:
         )
         outcome = self.broker.run_sync(request)
         self._write_collapsed_perf_script(outcome.stdout, output)
-        self._cache_conversion(key, output)
+        self._cache_scratch_artifact(key, output)
         return output, "perf"
 
     @staticmethod
@@ -2088,15 +1963,15 @@ class AnalysisRuntime:
             "".join(f"{';'.join(stack)} {count}\n" for stack, count in sorted(stacks.items()))
         )
 
-    def _nsys_parquetdir(self, source: ResolvedSource, limits: RequestLimits) -> tuple[Path, str]:
+    def _nsys_parquetdir(self, source: NativeSource, limits: RequestLimits) -> tuple[Path, str]:
         binding = ExecutableResolver().require_host_tool(
             "nsys", cwd=source.path.parent, environment=dict(os.environ)
         )
         provider_version = binding.identity.sha256
         key = (source.sha256, provider_version)
-        cached = self.conversions.get(key)
+        cached = self.scratch_artifacts.get(key)
         if cached is not None and cached.is_dir():
-            self.conversions.move_to_end(key)
+            self.scratch_artifacts.move_to_end(key)
             return cached, provider_version
         conversion_root = self.scratch / "conversions"
         conversion_root.mkdir(exist_ok=True)
@@ -2137,18 +2012,18 @@ class AnalysisRuntime:
             raise RuntimeFailure(
                 "EXECUTION_FAILURE", "Nsight Systems did not create a parquetdir export"
             )
-        self._cache_conversion(key, exported)
+        self._cache_scratch_artifact(key, exported)
         return exported, provider_version
 
-    def _xctrace_toc(self, source: ResolvedSource, limits: RequestLimits) -> tuple[Path, str]:
+    def _xctrace_toc(self, source: NativeSource, limits: RequestLimits) -> tuple[Path, str]:
         binding = ExecutableResolver().require_host_tool(
             "xcrun", cwd=source.path.parent, environment=dict(os.environ)
         )
         provider_version = binding.identity.sha256
         key = (source.sha256, f"xctrace-toc:{provider_version}")
-        cached = self.conversions.get(key)
+        cached = self.scratch_artifacts.get(key)
         if cached is not None and cached.is_file():
-            self.conversions.move_to_end(key)
+            self.scratch_artifacts.move_to_end(key)
             return cached, provider_version
         conversion_root = self.scratch / "conversions"
         conversion_root.mkdir(exist_ok=True)
@@ -2184,11 +2059,11 @@ class AnalysisRuntime:
             raise RuntimeFailure(
                 "EXECUTION_FAILURE", "xctrace did not create a table-of-contents export"
             )
-        self._cache_conversion(key, output)
+        self._cache_scratch_artifact(key, output)
         return output, provider_version
 
     def _resource_policy(self, limits: RequestLimits, *, writable_root: Path) -> ResourcePolicy:
-        _used_bytes, used_files = self._scratch_usage()
+        _used_bytes, used_files = self._scratch_commitment(consuming_root=writable_root)
         remaining_files = MAX_SESSION_SCRATCH_FILES - used_files - 4
         if remaining_files < 1:
             raise RuntimeFailure(
@@ -2205,7 +2080,7 @@ class AnalysisRuntime:
 
     def _iter_rows(self, path: Path, format_name: str) -> Iterator[dict[str, Any]]:
         if path.is_dir():
-            for item in self._directory_files(path):
+            for item in directory_files(path):
                 yield {"path": item.relative_to(path).as_posix(), "size_bytes": item.stat().st_size}
         elif format_name == "parquet":
             import pyarrow.parquet as parquet
@@ -2230,58 +2105,11 @@ class AnalysisRuntime:
             "pytest",
             "coverage",
         }:
-            with path.open("rb") as stream:
-                prefix = b""
-                while chunk := stream.read(4096):
-                    significant = chunk.lstrip(b" \t\r\n")
-                    if significant:
-                        prefix = significant[:1]
-                        break
-                stream.seek(0)
-                if prefix == b"[":
-                    for value in ijson.items(stream, "item", use_float=True):
-                        yield value if isinstance(value, dict) else {"value": value}
-                    return
-            yield from self._iter_json_object(path)
+            yield from iter_json_rows(path)
         else:
             with path.open(encoding="utf-8", errors="replace") as stream:
                 for number, line in enumerate(stream, 1):
                     yield {"line": number, "text": line.rstrip("\n")}
-
-    @staticmethod
-    def _iter_json_object(path: Path) -> Iterator[dict[str, Any]]:
-        entries: list[tuple[str, str, Any]] = []
-        current_key: str | None = None
-        with path.open("rb") as stream:
-            for prefix, event, value in ijson.parse(stream, use_float=True):
-                if prefix == "" and event == "map_key":
-                    current_key = str(value)
-                elif current_key is not None and prefix == current_key:
-                    key = current_key
-                    if event == "start_array":
-                        entries.append(("array", key, None))
-                        current_key = None
-                    if event in {"string", "number", "boolean", "null"}:
-                        entries.append(("scalar", key, value))
-                        current_key = None
-                    elif event == "start_map":
-                        entries.append(("object", key, None))
-                        current_key = None
-        if any(kind == "array" for kind, _key, _value in entries):
-            entries = [entry for entry in entries if entry[0] != "object"]
-        for kind, key, value in entries:
-            if kind == "array":
-                with path.open("rb") as stream:
-                    for item in ijson.items(stream, f"{key}.item", use_float=True):
-                        yield (
-                            {"section": key, **item}
-                            if isinstance(item, dict)
-                            else {"section": key, "value": item}
-                        )
-            elif kind == "object":
-                yield {"key": key, "value_type": "object"}
-            else:
-                yield {"key": key, "value": value}
 
     def _shrink_result(
         self, result: dict[str, Any], limit: int, identity: Mapping[str, Any], offset: int
@@ -2528,54 +2356,37 @@ class AnalysisRuntime:
             raise RuntimeFailure("INVALID_INPUT", "cwd must be a directory")
         return resolved
 
-    @staticmethod
-    def _hash_path(
-        path: Path,
-        *,
-        max_bytes: int | None = None,
-        max_files: int | None = None,
-    ) -> tuple[str, int, int]:
-        if not path.is_file() and not path.is_dir():
-            raise RuntimeFailure(
-                "INVALID_INPUT", f"Source is not a regular file or directory: {path}"
-            )
-        if path.is_file():
-            digest, size = sha256_file(path)
-            if max_bytes is not None and size > max_bytes:
-                raise RuntimeFailure("LIMIT_EXCEEDED", "Input exceeds max_input_bytes")
-            if max_files is not None and max_files < 1:
-                raise RuntimeFailure("LIMIT_EXCEEDED", "Input exceeds max_input_files")
-            return digest, size, 1
-        directory_digest, size = hashlib.sha256(), 0
-        files = AnalysisRuntime._directory_files(path, max_files=max_files)
-        for item in files:
-            item_digest, item_size = sha256_file(item)
-            if max_bytes is not None and size + item_size > max_bytes:
-                raise RuntimeFailure("LIMIT_EXCEEDED", "Input exceeds max_input_bytes")
-            directory_digest.update(
-                item.relative_to(path).as_posix().encode() + bytes.fromhex(item_digest)
-            )
-            size += item_size
-        return directory_digest.hexdigest(), size, len(files)
-
-    @staticmethod
-    def _directory_files(path: Path, *, max_files: int | None = None) -> list[Path]:
-        files: list[Path] = []
-        for item in sorted(path.rglob("*")):
-            if item.is_symlink():
-                raise RuntimeFailure(
-                    "INVALID_INPUT", f"Directory sources cannot contain symlinks: {item}"
-                )
-            if not item.is_file() and not item.is_dir():
-                raise RuntimeFailure(
-                    "INVALID_INPUT", f"Directory sources cannot contain special files: {item}"
-                )
-            if item.is_file():
-                files.append(item)
-                if max_files is not None and len(files) > max_files:
-                    raise RuntimeFailure("LIMIT_EXCEEDED", "Input exceeds max_input_files")
-        return files
-
-    def _scratch_usage(self) -> tuple[int, int]:
+    def _scratch_commitment(self, *, consuming_root: Path | None = None) -> tuple[int, int]:
         files = [item for item in self.scratch.rglob("*") if item.is_file()]
-        return sum(item.stat().st_size for item in files), len(files)
+        sizes = {item: item.stat().st_size for item in files}
+        used_bytes, used_files = sum(sizes.values()), len(sizes)
+        for root, (reserved_bytes, reserved_files) in self._capture_reservations.items():
+            if consuming_root is not None and consuming_root.is_relative_to(root):
+                continue
+            allocated = [size for path, size in sizes.items() if path.is_relative_to(root)]
+            used_bytes += max(0, reserved_bytes - sum(allocated))
+            used_files += max(0, reserved_files - len(allocated))
+        return used_bytes, used_files
+
+    @contextmanager
+    def _capture_scope(self) -> Iterator[Path]:
+        root = self.scratch / f"capture-{secrets.token_hex(12)}"
+        try:
+            yield root
+        except BaseException:
+            for analysis_id, cached in list(self.analyses.items()):
+                if any(
+                    source.path.is_relative_to(root) or root.is_relative_to(source.path)
+                    for source in cached.sources
+                ):
+                    del self.analyses[analysis_id]
+            raise
+        finally:
+            self._capture_reservations.pop(root, None)
+            if not any(
+                source.path.is_relative_to(root) or root.is_relative_to(source.path)
+                for cached in self.analyses.values()
+                if cached.preserved is None
+                for source in cached.sources
+            ):
+                shutil.rmtree(root, ignore_errors=True)

@@ -26,13 +26,14 @@ from pydantic import ValidationError
 
 from flameox import __version__
 from flameox.canonical import canonical_bytes
+from flameox.evidence_models import CaptureRequest
 from flameox.mcp import create_server
 from flameox.mcp.capability_tools import (
     analysis_tool_name,
     capture_tool_name,
 )
 from flameox.providers.contracts import ProviderAnalysis
-from flameox.repository import AGENT_EVIDENCE_MEDIA_TYPE, EvidenceRepository, RepositoryError
+from flameox.repository import AGENT_EVIDENCE_MEDIA_TYPE, EvidenceRepository
 from flameox.runtime_contracts import (
     CAPABILITIES,
     MAX_ROWS,
@@ -80,8 +81,8 @@ def test_repository_rejects_invalid_nested_capture_target(field: str, invalid: A
     }
     target[field] = invalid
 
-    with pytest.raises(RepositoryError):
-        EvidenceRepository._validate_capture_request(request)
+    with pytest.raises(ValidationError):
+        CaptureRequest.model_validate(request)
 
 
 @pytest.mark.unit
@@ -676,8 +677,11 @@ def test_json_object_sequence_is_streamed_with_bounded_continuation(tmp_path: Pa
     finally:
         runtime.close()
 
-    assert [row["value"] for row in first["blocks"][1]["rows"]] == [0, 1, 2]
-    assert [row["value"] for row in second["blocks"][1]["rows"]] == [3, 4, 5]
+    first_rows = first["blocks"][1]["rows"]
+    assert first_rows[0]["key"] == "metadata"
+    assert first_rows[0]["value_type"] == "object"
+    assert [row["value"] for row in first_rows[1:]] == [0, 1]
+    assert [row["value"] for row in second["blocks"][1]["rows"]] == [2, 3, 4]
 
 
 @pytest.mark.unit
@@ -3722,7 +3726,10 @@ def test_missing_repository_metadata_does_not_hide_preserved_evidence(tmp_path: 
             runtime.read_evidence(preserved["evidence_id"])
         assert read_failure.value.code == "REPOSITORY_CORRUPTION"
         second = runtime.analyze(
-            "artifact.preview", [PathSource(path=str(artifact))], {"offset": 1}
+            "artifact.preview",
+            [PathSource(path=str(artifact))],
+            {},
+            limits=RequestLimits(max_rows=2),
         )
         with pytest.raises(RuntimeFailure) as preserve_failure:
             runtime.preserve_evidence(second["analysis_id"])
@@ -4033,7 +4040,7 @@ def test_repository_rejects_self_consistent_manifest_with_invalid_body_shape(
         malformed_id = hashlib.sha256(canonical_bytes(manifest["body"])).hexdigest()
         manifest["evidence_id"] = malformed_id
         malformed_bundle = bundle.parent.parent / malformed_id[:2] / malformed_id
-        malformed_bundle.parent.mkdir()
+        malformed_bundle.parent.mkdir(exist_ok=True)
         bundle.rename(malformed_bundle)
         (malformed_bundle / "manifest.json").write_bytes(canonical_bytes(manifest))
 
