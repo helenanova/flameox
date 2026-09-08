@@ -2,6 +2,11 @@
 
 All notable changes to flameox are documented in this file.
 
+## [0.2.7] - 2026-09-08
+
+### Features
+
+- **runtime:** Make capture retention and workload budgets explicit (#476) ([#476](https://github.com/morluto/flameox/pull/476))
 ## [0.2.6] - 2026-09-06
 
 ### Bug Fixes
