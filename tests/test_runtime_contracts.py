@@ -29,14 +29,14 @@ def test_capture_target_requires_an_absolute_working_directory() -> None:
 @pytest.mark.unit
 def test_path_source_omitted_kind_uses_advertised_default() -> None:
     """The public schema advertises PathSource.kind as optional (default "path")."""
-    source = TypeAdapter(Source).validate_python({"path": "/tmp/artifact.perf"})
+    source: Source = TypeAdapter(Source).validate_python({"path": "/tmp/artifact.perf"})
     assert isinstance(source, PathSource)
     assert source.kind == "path"
 
 
 @pytest.mark.unit
 def test_evidence_source_omitted_kind_still_selects_evidence_member() -> None:
-    source = TypeAdapter(Source).validate_python({"evidence_id": "a" * 64})
+    source: Source = TypeAdapter(Source).validate_python({"evidence_id": "a" * 64})
     assert isinstance(source, EvidenceSource)
     assert source.kind == "evidence"
 
@@ -50,7 +50,7 @@ def test_source_union_rejects_unknown_kind() -> None:
 @pytest.mark.unit
 def test_single_execution_omitted_kind_uses_advertised_default() -> None:
     """The public schema advertises SingleExecution.kind as optional (default "single")."""
-    execution = TypeAdapter(Execution).validate_python({})
+    execution: Execution = TypeAdapter(Execution).validate_python({})
     assert isinstance(execution, SingleExecution)
     assert execution.kind == "single"
 
